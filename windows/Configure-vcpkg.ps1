@@ -1,4 +1,7 @@
 ﻿param([string]$platform="x64-windows") #or x86-windows, arm64-windows
+Set-PSDebug -Trace 2
+
+
 $ErrorActionPreference = "Stop"
 $PSDefaultParameterValues['*:ErrorAction']='Stop'
 
@@ -7,11 +10,11 @@ if(!!(Get-Command 'tf' -ErrorAction SilentlyContinue) -eq $false -and $Env:GITHU
     Write-Error "You must run this script within Developer Powershell for Visual Studio"
     exit 1
 }
-if(Test-Path "$(Split-Path -Parent $MyInvocation.MyCommand.Path)\..\vcpkg" -ErrorAction SilentlyContinue)
-{
-    Write-Output "$(Split-Path -Parent $MyInvocation.MyCommand.Path)\..\vcpkg already found! Not setting up."
-    exit 1
-}
+# if(Test-Path "$(Split-Path -Parent $MyInvocation.MyCommand.Path)\..\vcpkg" -ErrorAction SilentlyContinue)
+# {
+#     Write-Output "$(Split-Path -Parent $MyInvocation.MyCommand.Path)\..\vcpkg already found! Not setting up."
+#     exit 1
+# }
 
 if($platform -eq "x64-windows")
 {
@@ -58,6 +61,51 @@ if($env:PROCESSOR_ARCHITECTURE -ne $arch)
     }
 }
 
+
+# ============================================
+# Check system CMake version and block if too new
+# ============================================
+
+$maxAllowed = [Version]"3.30.99"
+$skipnext = $false
+
+try {
+    $cmakeOutput = cmake --version 2>$null
+} catch {
+    Write-Output "CMake not found in PATH or error occurred. In principle good, vcpkg should install it. Please check it in the vcpckg outputs!"
+    $skipnext = $true
+}
+
+if (-not $skipnext)
+{
+    # Safe regex match (no use of $Matches)
+    $match = [regex]::Match($cmakeOutput, "cmake version ([0-9\.]+)")
+    if (-not $match.Success) {
+        Write-Error "Unable to parse CMake version."
+        exit 1
+    }
+
+    $cmakeVersion = [Version]$match.Groups[1].Value
+    Write-Output "Detected CMake version: $cmakeVersion"
+
+    if ($cmakeVersion -gt $maxAllowed) {
+        Write-Output "CMake version is too new and will cause vcpkg installation to fail."
+        Write-Output "As many dependencies have not yet been updated to support the latest CMake, you have two solutions:"
+        Write-Output "1. Temporarily put in your cmake installation directory (e.g. C:\Program Files\CMake\bin) an older version (replace the cmake.exe file); rerun this script; then restore the original cmake."
+        Write-Output "2. Uninstall cmake and install an older version (this vcpkg will install cmake version 3.30.1)."
+        Write-Output "Link to an older version that will force vcpkg to install its own: https://github.com/Kitware/CMake/releases/tag/v3.29.6"
+        Write-Output "CMake version $cmakeVersion is too new. Maximum allowed is $maxAllowed."
+        Read-Host "Press Enter if you wish to try to continue anyways (not recommended, and likely to fail), or CTRL+C to stop & fix."
+    }
+}
+
+
+Write-Output "Continuing after cmake check..."
+
+
+
+
+
 #Setup vcpkg
 Write-Output "Configuring vcpkg..."
 cd "$(Split-Path -Parent $MyInvocation.MyCommand.Path)\.."
@@ -65,16 +113,32 @@ git clone https://github.com/microsoft/vcpkg -b 2025.01.13
 cd vcpkg
 .\bootstrap-vcpkg.bat
 
+# Read-Host "bootstrap done. Press Enter"
+
+
+# Read-Host "Start installing. Press Enter"
+
 # Core packages. libxml2 is for libiio
 .\vcpkg install --triplet $platform pthreads libjpeg-turbo tiff libpng glfw3 libusb fftw3 libxml2 portaudio nng zstd armadillo opencl curl[schannel] hdf5[cpp] sqlite3
 
+# Paths adjusted to get the stuff from vcpkg
+$CMAKE330 = "$(Split-Path -Parent $MyInvocation.MyCommand.Path)\..\vcpkg\downloads\tools\cmake-3.30.1-windows\cmake-3.30.1-windows-i386\bin\"
+$env:PATH = "$CMAKE330;$env:PATH"
+$PWSH = "$(Split-Path -Parent $MyInvocation.MyCommand.Path)\..\vcpkg\downloads\tools\powershell-core-7.2.24-windows\"
+$env:PATH = "$PWSH;$env:PATH"
+
+# Read-Host "Path adjust. Press Enter"
+
+
 # Entirely for UHD...
-.\vcpkg install --triplet $platform boost-chrono boost-date-time boost-filesystem boost-program-options boost-system boost-serialization boost-thread `
-                                    boost-test boost-format boost-asio boost-math boost-graph boost-units boost-lockfree boost-circular-buffer        `
-                                    boost-assign boost-dll
+# .\vcpkg install --triplet $platform boost-chrono boost-date-time boost-filesystem boost-program-options boost-system boost-serialization boost-thread `
+#                                     boost-test boost-format boost-asio boost-math boost-graph boost-units boost-lockfree boost-circular-buffer        `
+#                                     boost-assign boost-dll
 
 #Start Building Dependencies
-$null = mkdir build
+if (-not (Test-Path "build")) {
+    $null = mkdir build
+}
 cd build
 $build_args="-DCMAKE_TOOLCHAIN_FILE=$($(Get-Item ..\scripts\buildsystems\vcpkg.cmake).FullName)", "-DVCPKG_TARGET_TRIPLET=$platform", "-DCMAKE_INSTALL_PREFIX=$($(Get-Item ..\installed\$platform).FullName)", "-DCMAKE_BUILD_TYPE=Release", "-A", $generator
 $standard_include=$(Get-Item ..\installed\$platform\include).FullName
@@ -105,6 +169,7 @@ cp -Force ..\build\$toolset_used\$generator\Debug\dll\libusb-1.0.lib ..\..\..\in
 cp -force ..\libusb\libusb.h ..\..\..\installed\$platform\include
 cd ..\..
 rm -recurse -force libusb
+
 
 Write-Output "Building cpu_features..."
 git clone https://github.com/google/cpu_features -b v0.10.1
@@ -141,17 +206,17 @@ cmake --install .
 cd ..\..\..
 rm -recurse -force airspyone_host
 
-Write-Output "Building Airspy HF..."
-#git clone https://github.com/airspy/airspyhf --depth 1 #-b 1.6.8
-git clone https://github.com/JVital2013/airspyhf -b rawio #Enables RAW_IO to avoid sample drops
-cd airspyhf\libairspyhf
-$null = mkdir build
-cd build
-cmake $build_args -DLIBUSB_INCLUDE_DIR="$($libusb_include)" -DLIBUSB_LIBRARIES="$($libusb_lib)" -DTHREADS_PTHREADS_WIN32_LIBRARY="$($pthread_lib)" ..
-cmake --build . --config Release
-cmake --install .
-cd ..\..\..
-rm -recurse -force airspyhf
+# Write-Output "Building Airspy HF..."
+# #git clone https://github.com/airspy/airspyhf --depth 1 #-b 1.6.8
+# git clone https://github.com/JVital2013/airspyhf -b rawio #Enables RAW_IO to avoid sample drops
+# cd airspyhf\libairspyhf
+# $null = mkdir build
+# cd build
+# cmake $build_args -DLIBUSB_INCLUDE_DIR="$($libusb_include)" -DLIBUSB_LIBRARIES="$($libusb_lib)" -DTHREADS_PTHREADS_WIN32_LIBRARY="$($pthread_lib)" ..
+# cmake --build . --config Release
+# cmake --install .
+# cd ..\..\..
+# rm -recurse -force airspyhf
 
 Write-Output "Building RTL-SDR..."
 #git clone https://github.com/osmocom/rtl-sdr --depth 1 -b v2.0.2
@@ -177,34 +242,36 @@ cmake --install .
 cd ..\..\..\..
 rm -recurse -force hackrf
 
-Write-Output "Building HydraSDR..."
-git clone https://github.com/hydrasdr/rfone_host -b v1.0.1 #TODO: Patch for Raw IO support to avoid sample drops?
-cd rfone_host\libhydrasdr
-$null = mkdir build
-cd build
-cmake $build_args -DLIBUSB_INCLUDE_DIR="$($libusb_include)" -DLIBUSB_LIBRARIES="$($libusb_lib)" -DTHREADS_PTHREADS_WIN32_LIBRARY="$($pthread_lib)" ..
-cmake --build . --config Release
-cmake --install .
-cd ..\..\..
-rm -recurse -force rfone_host
+# Write-Output "Building HydraSDR..."
+# git clone https://github.com/hydrasdr/rfone_host -b v1.0.1 #TODO: Patch for Raw IO support to avoid sample drops?
+# cd rfone_host\libhydrasdr
+# $null = mkdir build
+# cd build
+# cmake $build_args -DLIBUSB_INCLUDE_DIR="$($libusb_include)" -DLIBUSB_LIBRARIES="$($libusb_lib)" -DTHREADS_PTHREADS_WIN32_LIBRARY="$($pthread_lib)" ..
+# cmake --build . --config Release
+# cmake --install .
+# cd ..\..\..
+# rm -recurse -force rfone_host
 
-Write-Output "Building FobosSDR..."
-git clone https://github.com/rigexpert/libfobos -b v.2.2.2 #TODO: Patch for Raw IO support to avoid sample drops?
-cd libfobos
 
-# FobosSDR wants us to load libusb into its directory, and install udev rules to the root of the drive.
-# We want it to share libusb, with no udev. Patches herein to make it play ball
-(Get-Content -raw CMakeLists.txt) -replace "(?ms)find_package\(PkgConfig\).*message\(FATAL_ERROR `"LibUSB 1.0 required`"\)`r`nendif\(\)", "" | Set-Content -Encoding ASCII CMakeLists.txt
-(Get-Content -raw CMakeLists.txt) -replace "(?ms)ADD_CUSTOM_COMMAND.*Release\r\n\)", "" | Set-Content -Encoding ASCII CMakeLists.txt
-(Get-Content -raw CMakeLists.txt) -replace "(?ms)install\(.*`"udev`"`r`n    \)", "" | Set-Content -Encoding ASCII CMakeLists.txt
+# Write-Output "Building FobosSDR..."
+# git clone https://github.com/rigexpert/libfobos -b v.2.2.2 #TODO: Patch for Raw IO support to avoid sample drops?
+# cd libfobos
 
-$null = mkdir build
-cd build
-cmake $build_args -DLIBUSB_INCLUDE_DIRS="$($standard_include)" -DLIBUSB_LIBRARIES="$($(Get-Item $libusb_lib).Directory.FullName)" -DCMAKE_INSTALL_LIBDIR="$($standard_lib)" ..
-cmake --build . --config Release
-cmake --install .
-cd ..\..
-rm -recurse -force libfobos
+# # FobosSDR wants us to load libusb into its directory, and install udev rules to the root of the drive.
+# # We want it to share libusb, with no udev. Patches herein to make it play ball
+# (Get-Content -raw CMakeLists.txt) -replace "(?ms)find_package\(PkgConfig\).*message\(FATAL_ERROR `"LibUSB 1.0 required`"\)`r`nendif\(\)", "" | Set-Content -Encoding ASCII CMakeLists.txt
+# (Get-Content -raw CMakeLists.txt) -replace "(?ms)ADD_CUSTOM_COMMAND.*Release\r\n\)", "" | Set-Content -Encoding ASCII CMakeLists.txt
+# (Get-Content -raw CMakeLists.txt) -replace "(?ms)install\(.*`"udev`"`r`n    \)", "" | Set-Content -Encoding ASCII CMakeLists.txt
+
+# $null = mkdir build
+# cd build
+# cmake $build_args -DLIBUSB_INCLUDE_DIRS="$($standard_include)" -DLIBUSB_LIBRARIES="$($(Get-Item $libusb_lib).Directory.FullName)" -DCMAKE_INSTALL_LIBDIR="$($standard_lib)" ..
+# cmake --build . --config Release
+# cmake --install .
+# cd ..\..
+# rm -recurse -force libfobos
+
 
 Write-Output "Building libiio..."
 git clone https://github.com/analogdevicesinc/libiio --depth 1 -b v0.26
@@ -247,51 +314,58 @@ if($platform -eq "x64-windows" -or $platform -eq "x86-windows")
     rm -recurse -force LimeSuite
 }
 
-Write-Output "Building bladeRF..."
-git clone https://github.com/Nuand/bladeRF --depth 1 -b 2024.05
-cd bladeRF\host
-Clear-Content cmake/modules/FindLibPThreadsWin32.cmake
-Clear-Content cmake/modules/FindLibUSB.cmake
-(Get-Content -raw CMakeLists.txt) -replace "(?ms)find_package\(LibPThreadsWin32\).*endif\(LIBUSB_FOUND\)", "" | Set-Content -Encoding ASCII CMakeLists.txt
-$null = mkdir build
-cd build
-cmake $build_args $fx3_arg -DTREAT_WARNINGS_AS_ERRORS=OFF -DLIBPTHREADSWIN32_INCLUDE_DIRS="$($standard_include)" -DLIBUSB_INCLUDE_DIRS="$($libusb_include)" -DLIBUSB_LIBRARIES="$($libusb_lib)" -DLIBPTHREADSWIN32_LIBRARIES="$($pthread_lib)" -DTEST_LIBBLADERF=OFF -DLIBUSB_FOUND=ON -DLIBPTHREADSWIN32_FOUND=ON -DLIBUSB_VERSION="$($(ls ..\..\..\..\installed\vcpkg\info\libusb*).BaseName.split('_')[1])" ..
-cmake --build . --config Release
-cmake --install .
-cd ..\..\..
-rm -recurse -force bladeRF
 
-# Not compatible with ARM at this time
-if($platform -eq "x64-windows" -or $platform -eq "x86-windows")
-{
-    rm -recurse -force FX3-SDK, FX3-SDK.zip
-}
+# Write-Output "Building bladeRF..."
+# git clone https://github.com/Nuand/bladeRF --depth 1 -b 2024.05
+# cd bladeRF\host
+# Clear-Content cmake/modules/FindLibPThreadsWin32.cmake
+# Clear-Content cmake/modules/FindLibUSB.cmake
+# (Get-Content -raw CMakeLists.txt) -replace "(?ms)find_package\(LibPThreadsWin32\).*endif\(LIBUSB_FOUND\)", "" | Set-Content -Encoding ASCII CMakeLists.txt
+# $null = mkdir build
+# cd build
+# cmake $build_args $fx3_arg -DTREAT_WARNINGS_AS_ERRORS=OFF -DLIBPTHREADSWIN32_INCLUDE_DIRS="$($standard_include)" -DLIBUSB_INCLUDE_DIRS="$($libusb_include)" -DLIBUSB_LIBRARIES="$($libusb_lib)" -DLIBPTHREADSWIN32_LIBRARIES="$($pthread_lib)" -DTEST_LIBBLADERF=OFF -DLIBUSB_FOUND=ON -DLIBPTHREADSWIN32_FOUND=ON -DLIBUSB_VERSION="$($(ls ..\..\..\..\installed\vcpkg\info\libusb*).BaseName.split('_')[1])" ..
+# cmake --build . --config Release
+# cmake --install .
+# cd ..\..\..
+# rm -recurse -force bladeRF
 
-Write-Output "Building UHD..."
-git clone https://github.com/EttusResearch/uhd # v4.8 (latest as of this writing) is not compatible with the latest MSVC
-cd uhd\host
-$null = mkdir build
-cd build
-cmake $build_args -DENABLE_MAN_PAGES=OFF -DENABLE_MANUAL=OFF -DENABLE_PYTHON_API=OFF -DENABLE_EXAMPLES=OFF -DENABLE_UTILS=OFF -DENABLE_TESTS=OFF -DPYTHON_EXECUTABLE="$((Get-Command python3).Source)" ..
-cmake --build . --config Release
-cmake --install .
-cd ..\..\..
-rm -recurse -force uhd
+# # Not compatible with ARM at this time
+# if($platform -eq "x64-windows" -or $platform -eq "x86-windows")
+# {
+#     rm -recurse -force FX3-SDK, FX3-SDK.zip
+# }
 
-cd ..
-rm -recurse -force build
 
-#Install SDRPlay API
-Invoke-WebRequest -Uri "https://www.satdump.org/SDRPlay.zip" -OutFile sdrplay.zip
-mkdir sdrplay | Out-Null
-Expand-Archive sdrplay.zip .
-cp sdrplay\API\inc\*.h installed\$platform\include
-cp sdrplay\API\$sdrplay_arch\sdrplay_api.dll installed\$platform\bin
-cp sdrplay\API\$sdrplay_arch\sdrplay_api.lib installed\$platform\lib
-Remove-Item sdrplay -Force -Recurse -ErrorAction SilentlyContinue
-Remove-Item sdrplay.zip
+
+# Write-Output "Building UHD..."
+# git clone https://github.com/EttusResearch/uhd # v4.8 (latest as of this writing) is not compatible with the latest MSVC
+# cd uhd\host
+# $null = mkdir build
+# cd build
+# cmake $build_args -DENABLE_MAN_PAGES=OFF -DENABLE_MANUAL=OFF -DENABLE_PYTHON_API=OFF -DENABLE_EXAMPLES=OFF -DENABLE_UTILS=OFF -DENABLE_TESTS=OFF -DPYTHON_EXECUTABLE="$((Get-Command python3).Source)" ..
+# cmake --build . --config Release
+# cmake --install .
+# cd ..\..\..
+# rm -recurse -force uhd
+
+# cd ..
+# rm -recurse -force build
+
+
+# #Install SDRPlay API
+# Invoke-WebRequest -Uri "https://www.satdump.org/SDRPlay.zip" -OutFile sdrplay.zip
+# mkdir sdrplay | Out-Null
+# Expand-Archive sdrplay.zip .
+# cp sdrplay\API\inc\*.h installed\$platform\include
+# cp sdrplay\API\$sdrplay_arch\sdrplay_api.dll installed\$platform\bin
+# cp sdrplay\API\$sdrplay_arch\sdrplay_api.lib installed\$platform\lib
+# Remove-Item sdrplay -Force -Recurse -ErrorAction SilentlyContinue
+# Remove-Item sdrplay.zip
+
+
 
 #Clean Up (Some packages are silly)
+cd "$(Split-Path -Parent $MyInvocation.MyCommand.Path)\..\vcpkg"
 mv installed\$platform\lib\*.dll installed\$platform\bin\
 mv installed\$platform\bin\*.lib installed\$platform\lib\
 cd ..
