@@ -9,6 +9,7 @@ namespace satdump
 {
     void ObjectTracker::backend_run()
     {
+        time_t lastTime = 0;
         while (backend_should_run)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -54,6 +55,13 @@ namespace satdump
 
                     sat_current_pos.az = satellite_observation_pos.azimuth * RAD_TO_DEG;
                     sat_current_pos.el = satellite_observation_pos.elevation * RAD_TO_DEG;
+
+                    if ((time(NULL) % 10 == 0 && lastTime != time(NULL)) && sat_current_pos.el > 0.0)
+                    {
+                        lastTime = time(NULL);    
+                        logger->info("Sat Position: Azimuth: %f, Elevation: %f", sat_current_pos.az, sat_current_pos.el);
+                    }
+
                 }
             }
 
